@@ -1,7 +1,7 @@
 payload:
-  - '.dsoo.de'
-  - '.appstorrent.ru'
-  - '.macked.app'
-  - '.pc528.net'
-  - '.sharedchat.cc'
-  - '.osssr.com'
+    - +.dsoo.de
+    - +.appstorrent.ru
+    - +.macked.app
+    - +.pc528.net
+    - +.sharedchat.cc
+    - +.osssr.com
