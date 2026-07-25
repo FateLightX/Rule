@@ -1,0 +1,79 @@
+name: Convert YAML rules to MRS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**.yaml"
+      - "**.yml"
+      - "scripts/convert_to_mrs.py"
+      - ".github/workflows/convert-mrs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: convert-mrs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: pip install --disable-pip-version-check pyyaml
+
+      - name: Install mihomo
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$(gh api repos/MetaCubeX/mihomo/releases/latest --jq .tag_name)"
+          asset="mihomo-linux-amd64-${tag}.gz"
+          url="https://github.com/MetaCubeX/mihomo/releases/download/${tag}/${asset}"
+          echo "Downloading ${url}"
+          curl -fsSL "$url" -o /tmp/mihomo.gz
+          gunzip -c /tmp/mihomo.gz > /tmp/mihomo
+          chmod +x /tmp/mihomo
+          /tmp/mihomo -v
+          echo "MIHOMO_BIN=/tmp/mihomo" >> "$GITHUB_ENV"
+
+      - name: Convert rulesets
+        run: python3 scripts/convert_to_mrs.py --mihomo "$MIHOMO_BIN"
+
+      - name: Commit and push MRS
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # stage new/modified mrs
+          while IFS= read -r -d '' file; do
+            git add -- "$file"
+          done < <(find . -type f -name '*.mrs' -print0)
+
+          # stage deleted mrs tracked by git
+          while IFS= read -r file; do
+            case "$file" in
+              *.mrs) git add -u -- "$file" ;;
+            esac
+          done < <(git ls-files --deleted)
+
+          if git diff --cached --quiet; then
+            echo "No MRS changes"
+            exit 0
+          fi
+
+          git commit -m "chore: update generated mrs [skip ci]"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

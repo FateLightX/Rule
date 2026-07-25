@@ -1,0 +1,5 @@
+# 示例：广告/追踪域名（可删可改）
+payload:
+  - ads.example.com
+  - +.tracker.example.com
+  - metrics.example.net
