@@ -1,4 +1,4 @@
-name: Convert YAML rules to MRS
+name: Convert YAML rules to MRS and SRS
 
 on:
   push:
@@ -14,7 +14,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: convert-mrs-${{ github.ref }}
+  group: convert-rules-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -49,31 +49,50 @@ jobs:
           /tmp/mihomo -v
           echo "MIHOMO_BIN=/tmp/mihomo" >> "$GITHUB_ENV"
 
-      - name: Convert rulesets
-        run: python3 scripts/convert_to_mrs.py --mihomo "$MIHOMO_BIN"
+      - name: Install sing-box
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$(gh api repos/SagerNet/sing-box/releases/latest --jq .tag_name)"
+          version="${tag#v}"
+          asset="sing-box-${version}-linux-amd64.tar.gz"
+          url="https://github.com/SagerNet/sing-box/releases/download/${tag}/${asset}"
+          echo "Downloading ${url}"
+          curl -fsSL "$url" -o /tmp/sing-box.tar.gz
+          tar -xzf /tmp/sing-box.tar.gz -C /tmp
+          install -m 0755 "/tmp/sing-box-${version}-linux-amd64/sing-box" /tmp/sing-box
+          /tmp/sing-box version
+          echo "SING_BOX_BIN=/tmp/sing-box" >> "$GITHUB_ENV"
 
-      - name: Commit and push MRS
+      - name: Convert rulesets
+        run: >-
+          python3 scripts/convert_to_mrs.py
+          --mihomo "$MIHOMO_BIN"
+          --sing-box "$SING_BOX_BIN"
+
+      - name: Commit and push generated rulesets
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # stage new/modified mrs
+          # stage new/modified generated rulesets
           while IFS= read -r -d '' file; do
             git add -- "$file"
-          done < <(find . -type f -name '*.mrs' -print0)
+          done < <(find . -type f \( -name '*.mrs' -o -name '*.srs' \) -print0)
 
-          # stage deleted mrs tracked by git
+          # stage deleted generated rulesets tracked by git
           while IFS= read -r file; do
             case "$file" in
-              *.mrs) git add -u -- "$file" ;;
+              *.mrs|*.srs) git add -u -- "$file" ;;
             esac
           done < <(git ls-files --deleted)
 
           if git diff --cached --quiet; then
-            echo "No MRS changes"
+            echo "No generated ruleset changes"
             exit 0
           fi
 
-          git commit -m "chore: update generated mrs [skip ci]"
+          git commit -m "chore: update generated rulesets [skip ci]"
           git push origin "HEAD:${GITHUB_REF_NAME}"

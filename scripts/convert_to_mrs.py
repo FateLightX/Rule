@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
-"""Convert Mihomo rule-set YAML files to .mrs next to the source.
+"""Convert rule-set YAML files to Mihomo .mrs and sing-box .srs files.
 
 Rules:
 - Scan all *.yaml / *.yml outside .github/
 - Expect standard rule-set shape with a `payload` list
 - Auto-detect type: domain vs ipcidr from payload content
-- Write <same-name>.mrs beside the YAML
-- Delete orphan .mrs whose YAML is gone
+- Write <same-name>.mrs and <same-name>.srs beside the YAML
+- Delete orphan .mrs/.srs files whose YAML is gone
 """
 
 from __future__ import annotations
 
 import argparse
 import ipaddress
+import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 try:
@@ -114,7 +116,77 @@ def detect_type(items: list[str], path: Path) -> str:
     )
 
 
-def convert_one(mihomo: Path, yaml_path: Path, dry_run: bool = False) -> Path:
+def build_sing_box_ruleset(items: list[str], rule_type: str, path: Path) -> dict[str, object]:
+    if rule_type == "ipcidr":
+        rule: dict[str, object] = {"ip_cidr": items}
+    else:
+        exact: list[str] = []
+        suffix: list[str] = []
+        regex: list[str] = []
+        for item in items:
+            if item.startswith("+."):
+                suffix.append(item[2:])
+            elif item.startswith("*."):
+                domain = item[2:]
+                regex.append(r"^(?:[^.]+\.)+" + re.escape(domain) + r"$")
+            elif item.startswith("."):
+                suffix.append(item[1:])
+            elif "*" in item or "+" in item:
+                raise ValueError(f"{path}: unsupported domain wildcard `{item}` for sing-box")
+            else:
+                exact.append(item)
+
+        rule = {}
+        if exact:
+            rule["domain"] = exact
+        if suffix:
+            rule["domain_suffix"] = suffix
+        if regex:
+            rule["domain_regex"] = regex
+
+    return {"version": 3, "rules": [rule]}
+
+
+def compile_srs(
+    sing_box: Path,
+    yaml_path: Path,
+    items: list[str],
+    rule_type: str,
+    dry_run: bool = False,
+) -> Path:
+    srs_path = yaml_path.with_suffix(".srs")
+    print(f"[convert] {yaml_path.relative_to(repo_root())} -> {srs_path.name} (sing-box)")
+    if dry_run:
+        return srs_path
+
+    source = build_sing_box_ruleset(items, rule_type, yaml_path)
+    with tempfile.TemporaryDirectory(prefix="sing-box-ruleset-") as tmpdir:
+        source_path = Path(tmpdir) / f"{yaml_path.stem}.json"
+        output_path = Path(tmpdir) / srs_path.name
+        source_path.write_text(json.dumps(source, ensure_ascii=True), encoding="utf-8")
+        subprocess.run(
+            [
+                str(sing_box),
+                "rule-set",
+                "compile",
+                "--output",
+                str(output_path),
+                str(source_path),
+            ],
+            check=True,
+        )
+        if not output_path.is_file() or output_path.stat().st_size == 0:
+            raise RuntimeError(f"failed to produce {srs_path}")
+        output_path.replace(srs_path)
+    return srs_path
+
+
+def convert_one(
+    mihomo: Path,
+    sing_box: Path,
+    yaml_path: Path,
+    dry_run: bool = False,
+) -> tuple[Path, Path]:
     items = load_payload(yaml_path)
     rule_type = detect_type(items, yaml_path)
     mrs_path = yaml_path.with_suffix(".mrs")
@@ -128,30 +200,36 @@ def convert_one(mihomo: Path, yaml_path: Path, dry_run: bool = False) -> Path:
     ]
     print(f"[convert] {yaml_path.relative_to(repo_root())} -> {mrs_path.name} ({rule_type})")
     if dry_run:
-        return mrs_path
+        srs_path = compile_srs(sing_box, yaml_path, items, rule_type, dry_run=True)
+        return mrs_path, srs_path
     subprocess.run(cmd, check=True)
     if not mrs_path.is_file() or mrs_path.stat().st_size == 0:
         raise RuntimeError(f"failed to produce {mrs_path}")
-    return mrs_path
+    srs_path = compile_srs(sing_box, yaml_path, items, rule_type)
+    return mrs_path, srs_path
 
 
 def cleanup_orphans(root: Path, yaml_files: list[Path], dry_run: bool = False) -> list[Path]:
-    expected = {p.with_suffix(".mrs").resolve() for p in yaml_files}
+    expected = {
+        p.with_suffix(suffix).resolve()
+        for p in yaml_files
+        for suffix in (".mrs", ".srs")
+    }
     removed: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIR_NAMES and not d.startswith(".")]
         base = Path(dirpath)
         for name in filenames:
-            if not name.lower().endswith(".mrs"):
+            if Path(name).suffix.lower() not in {".mrs", ".srs"}:
                 continue
-            mrs = (base / name).resolve()
-            if mrs in expected:
+            generated = (base / name).resolve()
+            if generated in expected:
                 continue
-            rel = mrs.relative_to(root.resolve())
+            rel = generated.relative_to(root.resolve())
             print(f"[delete] orphan {rel}")
-            removed.append(mrs)
+            removed.append(generated)
             if not dry_run:
-                mrs.unlink(missing_ok=True)
+                generated.unlink(missing_ok=True)
     return removed
 
 
@@ -170,10 +248,26 @@ def find_mihomo(explicit: str | None) -> Path:
     raise FileNotFoundError("mihomo binary not found; pass --mihomo /path/to/mihomo")
 
 
+def find_sing_box(explicit: str | None) -> Path:
+    if explicit:
+        path = Path(explicit)
+        if not path.is_file():
+            raise FileNotFoundError(f"sing-box not found: {path}")
+        return path
+
+    from shutil import which
+
+    found = which("sing-box")
+    if found:
+        return Path(found)
+    raise FileNotFoundError("sing-box binary not found; pass --sing-box /path/to/sing-box")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=repo_root())
     parser.add_argument("--mihomo", default=os.environ.get("MIHOMO_BIN"))
+    parser.add_argument("--sing-box", default=os.environ.get("SING_BOX_BIN"))
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
@@ -185,10 +279,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     mihomo = find_mihomo(args.mihomo)
+    sing_box = find_sing_box(args.sing_box)
     errors: list[str] = []
     for path in yaml_files:
         try:
-            convert_one(mihomo, path, dry_run=args.dry_run)
+            convert_one(mihomo, sing_box, path, dry_run=args.dry_run)
         except Exception as exc:  # noqa: BLE001 - collect all file errors
             errors.append(str(exc))
             print(f"[error] {exc}", file=sys.stderr)
